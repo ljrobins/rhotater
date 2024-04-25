@@ -38,10 +38,12 @@ def sn_cn_dn_am(x, k):
 
     K = PI / (2*agm(1.0,kp))  #TODO: fix with this https://dlmf.nist.gov/19.8#i.p1 to fufill https://dlmf.nist.gov/22.20
 
-    if x > K:
-       am = PI - am
-    if x < -K:
-       am = am - PI
+    n = ti.floor((x-K)/K/2)+1.0
+    direction = -2*(n % 2)+1
+
+    if n != 0.0:
+        am = n*PI + direction*am
+
     return sn, cn, dn, am
 
 @ti.pyfunc
