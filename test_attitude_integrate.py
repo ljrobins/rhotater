@@ -12,6 +12,11 @@ ti.init(arch=ti.gpu,
         num_compile_threads=32,
         opt_level=3)
 
+@ti.dataclass
+class PSOProblem:
+    global_weight = 1.0
+    neighbor_weight = 1.0
+
 @ti.func
 def rand_b2(r: float) -> ti.math.vec3:
     return r * rand_s2() * ti.random() ** (1 / 3)
@@ -70,13 +75,13 @@ def brdf_phong(
 @ti.kernel
 def integrate(itensor: ti.math.vec3) -> int:
     h = teval[1] - teval[0]
-    for i in q:
+    for i in current_states:
         for j in range(teval.shape[0]):
-            dcm = quat_to_dcm(q[i])
-            lc[i,j] = normalized_convex_light_curve(dcm @ L, dcm @ O)
+            dcm = quat_to_dcm(current_states[i][:4])
+            lc[i][j] = normalized_convex_light_curve(dcm @ L, dcm @ O)
             
-            q[i], w[i] = rk4_step(q[i], w[i], h, itensor)
-            q[i] = q[i].normalized()
+            current_states[i][:4], current_states[i][4:] = rk4_step(current_states[i][:4], current_states[i][4:], h, itensor)
+            current_states[i][:4] = current_states[i][:4].normalized()
 
     return 0 # to prevent taichi from lying about timing
 
@@ -132,22 +137,11 @@ fp.fill(3)
 L = ti.Vector([1.0, 0.0, 0.0]).normalized()
 O = ti.Vector([1.0, 1.0, 0.0]).normalized()
 
-
-@ti.kernel
-def one_lc_with_transform() -> float:
-    dcm = quat_to_dcm(q[0])
-    lc = normalized_convex_light_curve(dcm @ L, dcm @ O)
-    return lc
-
-# print(one_lc())
-# endd
-
-
 q0 = ti.Vector([0.0, 0.0, 0.0, 1.0])
 w0 = ti.Vector([1.0, 1.0, 1.0])
 itensor = ti.Vector([1.0, 2.0, 3.0])
 
-n = int(1e7)
+n = int(1e6)
 m = 20
 tmax = 10.0
 tspace = np.linspace(0, tmax, m, dtype=np.float32)
@@ -156,35 +150,122 @@ h = tspace[1] - tspace[0]
 teval = ti.field(dtype=ti.f32, shape=m)
 teval.from_numpy(tspace)
 
-q = ti.Vector.field(n=4, dtype=ti.f32, shape=n)
-w = ti.Vector.field(n=3, dtype=ti.f32, shape=n)
-lc = ti.field(dtype=ti.f32, shape=(n,teval.shape[0]))
+initial_states = ti.Vector.field(n=7, dtype=ti.f32, shape=n)
+states_v = ti.Vector.field(n=7, dtype=ti.f32, shape=n)
+current_states = ti.Vector.field(n=7, dtype=ti.f32, shape=n)
+lc = ti.Vector.field(n=teval.shape[0], dtype=ti.f32, shape=n)
+local_best_states = ti.Vector.field(n=7, dtype=ti.f32, shape=n)
+
+loss = ti.field(dtype=ti.f32, shape=(n,4)) # [i,j] is local current, local best, neighbor, and global loss for particle i
+loss.fill(np.inf)
+loss_inds = ti.field(dtype=ti.u32, shape=(n,4)) # [i,j] is global index of local, neighbor, and global loss for loss[i,j]
 
 # %%
 # Initializing the quaternion and angular velocity guesses
 
 @ti.kernel
-def initialize_quats() -> int:
-    for i in q:
-        q[i] = rand_s3()
+def initialize_states() -> int:
+    for i in current_states:
+        initial_states[i][:4] = rand_s3()
+        initial_states[i][4:] = rand_b2(1.0)
+        current_states[i] = initial_states[i]
     return 0
-
-initialize_quats()
 
 @ti.kernel
-def initialize_omegas() -> int:
-    for i in w:
-        w[i] = rand_b2(1.0)
+def reset_states() -> int:
+    for i in current_states:
+        current_states[i] = initial_states[i]
     return 0
 
-initialize_omegas()
 
-for i in range(5):
+@ti.kernel
+def compute_loss() -> float:
+    min_global_loss = np.inf
+    min_global_loss_ind = 0
+
+    # Computing local loss 
+    for i in range(loss.shape[0]):
+        lossi = (lc[i] - 0.4).norm_sqr()
+        loss[i,0] = lossi
+        # keeping track of the min global loss for this iteration
+        old_min_global_loss = ti.atomic_min(min_global_loss, loss[i,0])
+        if old_min_global_loss != min_global_loss:
+            min_global_loss_ind = i
+
+        # keeping track of the best loss seen by this particle
+        if loss[i,0] < loss[i,1]: # then this is the best loss seen by this particle
+            local_best_states[i] = initial_states[i]
+
+        left = (i-1) % loss.shape[0]
+        right = (i+1) % loss.shape[0]
+        if loss[left,0] < ti.min(loss[i,0], loss[right,0]):
+            loss_inds[i,2] = left
+            loss[i,2] = loss[left,0]
+        elif loss[right,0] < ti.min(loss[i,0], loss[left,0]):
+            loss_inds[i,2] = right
+            loss[i,2] = loss[right,0]
+        else:
+            loss_inds[i,2] = i
+            loss[i,2] = loss[i,0]
+    
+    # Filling in global best loss
+    for i in range(loss.shape[0]):
+        loss[i,3] = min_global_loss
+        loss_inds[i,3] = min_global_loss_ind
+    return min_global_loss
+
+@ti.kernel
+def update_states() -> int:
+    for i in range(loss.shape[0]):
+        local_best_state = local_best_states[i]
+        to_local_best = local_best_state - initial_states[i]
+        neighbor_best_state = initial_states[loss_inds[i,2]]
+        to_neighbor_best = neighbor_best_state - initial_states[i]
+        global_best_state = initial_states[loss_inds[i,3]]
+        to_global_best = global_best_state - initial_states[i]
+
+        scale_best_local = ti.Vector([ti.random(), ti.random(), ti.random(), ti.random(), ti.random(), ti.random(), ti.random()])
+        scale_neighbor = ti.Vector([ti.random(), ti.random(), ti.random(), ti.random(), ti.random(), ti.random(), ti.random()])
+        scale_global = ti.Vector([ti.random(), ti.random(), ti.random(), ti.random(), ti.random(), ti.random(), ti.random()])
+
+        acc = scale_best_local * to_local_best + 0.5 * scale_neighbor * to_neighbor_best + 0.5 * scale_global * to_global_best
+        states_v[i] += 0.004 * acc
+        if states_v[i].norm_sqr() > 1.0:
+            states_v[i] = states_v[i].normalized()
+        initial_states[i] += states_v[i]
+        
+        initial_states[i][:4] = initial_states[i][:4].normalized() # make sure the quaternion keeps its norm
+    return 0
+
+for i in range(1000):
+    t0 = time.time()
+    if i == 0:
+        initialize_states()
+
     t1 = time.time()
     integrate(itensor)
-    print(time.time()-t1)
-    qn = q.to_numpy()
-    wn = w.to_numpy()
-    lcn = lc.to_numpy()
+    # print(f'int time: {time.time()-t1:.1e}')
 
-    # print(qn)
+    t1 = time.time()
+    best_global_loss = compute_loss()
+    # print(f'loss time: {time.time()-t1:.1e}')
+
+    t1 = time.time()
+    update_states()
+    # print(f'update time: {time.time()-t1:.1e}')
+
+    reset_states()
+
+    print(f'total time: {time.time()-t0:.1e}')
+
+    print(best_global_loss)
+
+    # print(state_before-state_after)
+
+    # sn = initial_states.to_numpy()
+    # print(sn[:,:4])
+
+    # lcn = lc.to_numpy()
+
+    # print(loss)
+    # print(loss_inds)
